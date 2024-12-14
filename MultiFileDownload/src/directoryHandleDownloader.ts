@@ -1,32 +1,21 @@
+// Adapted from:
+//     https://github.com/ccvca/js-multi-file-download
+//     MIT Licensed, Copyright 2023 - 2024 Christian von Arnim
+// Modifications:
+// * Support creation of sub directories (not only flat file hierarchies).
+//   Required addition of `dirChain?` in the API.
+// * URL-decoding (file names with spaces were incorrectly handled).
+// * Updated to current TypeScript/eslint
 
-export namespace Exceptions {
-    export class MetadataError extends Error {
-        constructor(error: string) {
-            super(error);
-        }
-    }
-    export class DownloadError extends Error {
-        constructor(error: string) {
-            super(error);
-        }
-    }
-    export class FileExistError extends Error {
-        constructor(error: string) {
-            super(error);
-        }
-    }
-    export class InternalError extends Error {
-        constructor(error: string) {
-            super(error);
-        }
-    }
-
-    export class GeneralError extends Error {
-        public innerException: any;
-        constructor(error: string, innerException: any) {
-            super(error);
-            this.innerException = innerException;
-        }
+export class MetadataError extends Error {}
+export class DownloadError extends Error {}
+export class FileExistError extends Error {}
+export class InternalError extends Error {}
+export class GeneralError extends Error {
+    public innerException: any;
+    constructor(error: string, innerException: any) {
+        super(error);
+        this.innerException = innerException;
     }
 }
 
@@ -34,7 +23,8 @@ function getFilenameFromUrl(urlStr: string) {
     const url = new URL(urlStr, window.location.href);
     const pathname = url.pathname;
     const parts = pathname.split('/');
-    return parts.pop();
+    const filename = parts.pop();
+    return filename === undefined ? undefined : decodeURIComponent(filename); // came from `URL`, so was URL-encoded
 }
 
 interface DownloadFileOptions {
@@ -43,14 +33,24 @@ interface DownloadFileOptions {
 }
 
 export interface DownloadFileDesc {
-    url: string;
+    url: string; // string instead of URL so it can be given without origin, e.g. "myfile" or "/path/to/myfile"
     size?: number;
+    dirChain?: string[];
     fileName?: string;
 }
 
-export async function VerifyFileSize(dirHandle: FileSystemDirectoryHandle, reqFilename: string, size: number): Promise<boolean> {
+async function traverseDirChain(dirHandle: FileSystemDirectoryHandle, dirChain?: string[], options?: FileSystemGetDirectoryOptions) {
+    let dh = dirHandle;
+    for (const subDir of (dirChain ?? [])) {
+        dh = await dh.getDirectoryHandle(subDir, options);
+    }
+    return dh;
+}
+
+export async function VerifyFileSize(dirHandle: FileSystemDirectoryHandle, reqFilename: string, size: number, dirChain?: string[]): Promise<boolean> {
     try {
-        const fileHandle = await dirHandle.getFileHandle(reqFilename)
+        const parentDir = await traverseDirChain(dirHandle, dirChain);
+        const fileHandle = await parentDir.getFileHandle(reqFilename);
         const file = await fileHandle.getFile();
         return file.size === size;
     }
@@ -71,25 +71,26 @@ export async function DownloadFile(
 ): Promise<DownloadFileRet> {
     const filename = fileDesc.fileName === undefined ? getFilenameFromUrl(fileDesc.url) : fileDesc.fileName;
     if (filename === undefined) {
-        throw new Exceptions.MetadataError("Could not determine filename.");
+        throw new MetadataError("Could not determine filename.");
     }
 
-    if (fileDesc.size !== undefined && await VerifyFileSize(dirHandle, filename, fileDesc.size)) {
+    if (fileDesc.size !== undefined && await VerifyFileSize(dirHandle, filename, fileDesc.size, fileDesc.dirChain)) {
         return DownloadFileRet.SKIPPED_EXIST;
     }
 
     if (options.overrideExistingFile !== true) {
         try {
-            await dirHandle.getFileHandle(filename, { create: false });
-            throw new Exceptions.FileExistError(`File '${filename}' does already exist.`);
+            const parentDir = await traverseDirChain(dirHandle, fileDesc.dirChain);
+            await parentDir.getFileHandle(filename, { create: false }); // goal: throw if file exists
+            throw new FileExistError(`File '${filename}' does already exist.`);
         } catch (ex: unknown) {
             const domEx: DOMException = ex as DOMException;
-            if(ex instanceof Exceptions.FileExistError)
+            if(ex instanceof FileExistError)
             {
                 throw ex;
             }
             else if (domEx.name === undefined || domEx.name !== "NotFoundError") {
-                throw new Exceptions.FileExistError(`File: '${filename}' does already exist. Exeption: ${domEx.message}`);
+                throw new FileExistError(`File: '${filename}' does already exist. Exeption: ${domEx.message}`);
             }
         }
     }
@@ -97,21 +98,22 @@ export async function DownloadFile(
     const abortController = new AbortController();
     const response = await fetch(fileDesc.url, { signal: abortController.signal });
     if (!response.ok) {
-        throw new Exceptions.DownloadError(`Error while downloading: ${response.status} - ${response.statusText}`);
+        throw new DownloadError(`Error while downloading: ${response.status} - ${response.statusText}`);
     }
     if (response.body === null) {
-        throw new Exceptions.DownloadError(`No data`);
+        throw new DownloadError(`No data`);
     }
     let responseStream = response.body;
     if (options.progress !== undefined) {
         let loadedBytes = 0;
         const totalBytesStr = response.headers.get("content-length");
-        const totalBytes = Number.parseInt(totalBytesStr ?? '') || undefined;
+        const totalBytesOrNan = Number.parseInt(totalBytesStr ?? '');
+        const totalBytes = Number.isNaN(totalBytesOrNan) ? undefined : totalBytesOrNan;
         const progress = new TransformStream(
             {
                 transform(chunk, controller) {
                     loadedBytes += chunk.length;
-                    let precent = totalBytes !== undefined ? (loadedBytes / totalBytes) * 100 : undefined;
+                    const precent = totalBytes !== undefined ? (loadedBytes / totalBytes) * 100 : undefined;
                     if (options.progress === undefined) {
                         return;
                     }
@@ -130,13 +132,18 @@ export async function DownloadFile(
     }
 
     try {
-        const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
+        const parentDir = await traverseDirChain(dirHandle, fileDesc.dirChain, { create: true });
+        const fileHandle = await parentDir.getFileHandle(filename, { create: true });
         const writeable = await fileHandle.createWritable();
         await responseStream.pipeTo(writeable);
-    } catch (ex: any) {
+    } catch (ex: unknown) {
         // Abort possible pending request. (e.g. no permissions to create file, ...)
         abortController.abort();
-        throw new Exceptions.GeneralError(`Download of file ${filename} failed due to an exception: ${ex?.message}`, ex);
+        const errStr =
+            (ex instanceof Error) ? ex.message :
+            (typeof ex === "string") ? ex :
+            "unknown error";
+        throw new GeneralError(`Download of file ${filename} failed due to an exception: ${errStr}`, ex);
     }
 
     return DownloadFileRet.DOWNLOADED;
@@ -211,7 +218,7 @@ export async function DownloadFiles(dirHandle: FileSystemDirectoryHandle, files:
                     break;
                 default:
                     // Should never happen
-                    throw new Exceptions.InternalError(`Unknown return value from download function: ${ret} `);
+                    throw new InternalError(`Unknown return value from download function: ${JSON.stringify(ret)} `);
             }
 
         } catch (ex: unknown) {
